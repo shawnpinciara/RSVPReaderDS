@@ -1,0 +1,13 @@
+# Build output
+arm7/build/
+arm9/build/
+arm7/*.elf
+arm9/*.elf
+*.map
+
+# Books (user data — not tracked)
+book/*.txt
+book/.state
+
+# macOS
+.DS_Store
