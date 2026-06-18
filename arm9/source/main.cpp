@@ -1037,7 +1037,26 @@ class RSVPReaderApp : public Woopsi {
             const char* name  = slash ? slash + 1 : path;
             char buf[64]; snprintf(buf, sizeof(buf), "%.60s", name);
             _bookLabel->setText(WoopsiString(buf));
-            showWord(0);
+
+            // Restore saved position if the state file points at this book
+            int startWord = 0;
+            FILE* sf = fopen("/books/.state", "r");
+            if (sf) {
+                char spath[256] = {}; int sword = 0, swpm = 300;
+                bool ok = fgets(spath, sizeof(spath), sf) != nullptr;
+                if (ok) {
+                    int n = (int)strlen(spath);
+                    if (n > 0 && spath[n-1] == '\n') spath[--n] = 0;
+                    ok = (n > 0) && (fscanf(sf, "%d\n%d", &sword, &swpm) == 2);
+                }
+                fclose(sf);
+                if (ok && strcmp(spath, path) == 0) {
+                    startWord = std::min(sword, (int)_words.size() - 1);
+                    if (swpm >= 50 && swpm <= 1000) { _wpm = swpm; updateWpmLabel(); }
+                }
+            }
+
+            showWord(startWord);
             updateStatus("A to play");
         } else {
             updateStatus("Load failed!");
