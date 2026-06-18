@@ -445,6 +445,7 @@ struct ZipEntry {
 static bool zipParseCentralDir(FILE* f, std::vector<ZipEntry>& out) {
     fseek(f, 0, SEEK_END);
     const long fsz = ftell(f);
+    if (fsz < 22) return false;
     long eocd = -1;
     for (long i = fsz - 22; i >= std::max(0L, fsz - 22 - 65535L); i--) {
         fseek(f, i, SEEK_SET);
@@ -452,24 +453,28 @@ static bool zipParseCentralDir(FILE* f, std::vector<ZipEntry>& out) {
         if (sig == 0x06054b50) { eocd = i; break; }
     }
     if (eocd < 0) return false;
-    u16 numEntries; u32 cdOffset;
+    u16 numEntries = 0; u32 cdOffset = 0;
     fseek(f, eocd + 10, SEEK_SET); fread(&numEntries, 2, 1, f);
     fseek(f, eocd + 16, SEEK_SET); fread(&cdOffset,   4, 1, f);
+    if (numEntries == 0 || numEntries > 2000) return false;
+    if (cdOffset == 0 || (long)cdOffset >= fsz) return false;
     fseek(f, (long)cdOffset, SEEK_SET);
     out.reserve(numEntries);
     for (int i = 0; i < numEntries; i++) {
         u32 sig = 0; fread(&sig, 4, 1, f);
         if (sig != 0x02014b50) break;
-        u16 method;
+        u16 method = 0;
         fseek(f, 6, SEEK_CUR);
         fread(&method, 2, 1, f);
         fseek(f, 8, SEEK_CUR);
-        u32 cs, us; fread(&cs, 4, 1, f); fread(&us, 4, 1, f);
-        u16 nl, el, cl;
+        u32 cs = 0, us = 0; fread(&cs, 4, 1, f); fread(&us, 4, 1, f);
+        u16 nl = 0, el = 0, cl = 0;
         fread(&nl, 2, 1, f); fread(&el, 2, 1, f); fread(&cl, 2, 1, f);
         fseek(f, 8, SEEK_CUR);
-        u32 lo; fread(&lo, 4, 1, f);
-        ZipEntry e; e.name.resize(nl); fread(&e.name[0], 1, nl, f);
+        u32 lo = 0; fread(&lo, 4, 1, f);
+        if (nl == 0 || nl > 2048) { fseek(f, nl + el + cl, SEEK_CUR); continue; }
+        ZipEntry e; e.name.resize(nl);
+        if (fread(&e.name[0], 1, nl, f) != nl) break;
         fseek(f, el + cl, SEEK_CUR);
         e.localOff = lo; e.compSize = cs; e.uncompSize = us; e.method = method;
         out.push_back(std::move(e));
@@ -477,9 +482,14 @@ static bool zipParseCentralDir(FILE* f, std::vector<ZipEntry>& out) {
     return !out.empty();
 }
 
+static const u32 kMaxEntrySize = 768 * 1024;  // 768 KB per entry — fits in DS heap
+
 static bool zipReadEntry(FILE* f, const ZipEntry& e, std::string& out) {
+    if (e.uncompSize == 0 || e.uncompSize > kMaxEntrySize) return false;
+    if (e.compSize  == 0 || e.compSize  > kMaxEntrySize) return false;
+    u16 nl = 0, el = 0;
     fseek(f, (long)e.localOff + 26, SEEK_SET);
-    u16 nl, el; fread(&nl, 2, 1, f); fread(&el, 2, 1, f);
+    fread(&nl, 2, 1, f); fread(&el, 2, 1, f);
     fseek(f, nl + el, SEEK_CUR);
     if (e.method == 0) {
         out.resize(e.uncompSize);
@@ -497,20 +507,26 @@ static bool zipReadEntry(FILE* f, const ZipEntry& e, std::string& out) {
     if (inflateInit2(&z, -15) != Z_OK) return false;
     int r = inflate(&z, Z_FINISH);
     inflateEnd(&z);
-    return r == Z_STREAM_END;
+    if (r != Z_STREAM_END) { out.clear(); return false; }
+    return true;
 }
 
 // Return value of attribute `attr` within the range [tagP, tagEnd).
+// Handles any whitespace before the name and both " and ' quoting.
 static std::string attrVal(const char* tagP, const char* tagEnd, const char* attr) {
-    char needle[64]; snprintf(needle, sizeof(needle), " %s=\"", attr);
-    const int nlen = (int)strlen(needle);
-    for (const char* p = tagP; p < tagEnd - nlen; p++) {
-        if (strncmp(p, needle, nlen) == 0) {
-            const char* v = p + nlen;
-            const char* e = v;
-            while (e < tagEnd && *e != '"') e++;
-            return std::string(v, e - v);
-        }
+    const int alen = (int)strlen(attr);
+    for (const char* p = tagP; p < tagEnd - alen - 2; p++) {
+        if (!isspace((u8)*p)) continue;          // must be preceded by whitespace
+        if (strncmp(p + 1, attr, alen) != 0) continue;
+        const char* eq = p + 1 + alen;
+        if (eq >= tagEnd || *eq != '=') continue;
+        const char* vp = eq + 1;
+        if (vp >= tagEnd) continue;
+        const char q = (*vp == '"' || *vp == '\'') ? *vp++ : 0;
+        if (!q) continue;
+        const char* ve = vp;
+        while (ve < tagEnd && *ve != q) ve++;
+        return std::string(vp, ve - vp);
     }
     return "";
 }
@@ -813,40 +829,66 @@ class RSVPReaderApp : public Woopsi {
     bool loadEpub(const char* path) {
         FILE* f = fopen(path, "rb");
         if (!f) return false;
-        std::vector<ZipEntry> entries;
-        if (!zipParseCentralDir(f, entries)) { fclose(f); return false; }
-        std::map<std::string, int> nm;
-        for (int i = 0; i < (int)entries.size(); i++) nm[entries[i].name] = i;
 
-        auto it = nm.find("META-INF/container.xml");
-        if (it == nm.end()) { fclose(f); return false; }
-        std::string container;
-        if (!zipReadEntry(f, entries[it->second], container)) { fclose(f); return false; }
+        // Phase 1: resolve spine → list of (localOff, compSize, uncompSize, method).
+        // All heavy allocations (entries vector, nm map, opf string) live in this
+        // scope and are freed before the chapter-reading loop below.
+        struct ChInfo { u32 localOff, compSize, uncompSize; u16 method; };
+        std::vector<ChInfo> chapters;
+        {
+            std::vector<ZipEntry> entries;
+            if (!zipParseCentralDir(f, entries)) { fclose(f); return false; }
 
-        std::string opfPath = opfPathFrom(container);
-        if (opfPath.empty()) { fclose(f); return false; }
+            std::map<std::string, int> nm;
+            for (int i = 0; i < (int)entries.size(); i++) nm[entries[i].name] = i;
 
-        auto it2 = nm.find(opfPath);
-        if (it2 == nm.end()) { fclose(f); return false; }
-        std::string opf;
-        if (!zipReadEntry(f, entries[it2->second], opf)) { fclose(f); return false; }
+            auto nmGet = [&](const std::string& name, std::string& out) -> bool {
+                auto it = nm.find(name);
+                return it != nm.end() && zipReadEntry(f, entries[it->second], out);
+            };
 
-        std::string opfDir;
-        size_t sl = opfPath.rfind('/');
-        if (sl != std::string::npos) opfDir = opfPath.substr(0, sl + 1);
+            std::string container;
+            if (!nmGet("META-INF/container.xml", container)) { fclose(f); return false; }
 
-        std::vector<std::string> hrefs = epubSpineHrefs(opf, opfDir);
+            std::string opfPath = opfPathFrom(container);
+            if (opfPath.empty()) { fclose(f); return false; }
 
+            std::string opf;
+            if (!nmGet(opfPath, opf)) { fclose(f); return false; }
+
+            std::string opfDir;
+            size_t sl = opfPath.rfind('/');
+            if (sl != std::string::npos) opfDir = opfPath.substr(0, sl + 1);
+
+            for (const std::string& href : epubSpineHrefs(opf, opfDir)) {
+                // Only read HTML/XHTML content files; skip CSS, images, fonts
+                const char* dot = strrchr(href.c_str(), '.');
+                if (!dot) continue;
+                char ext[8] = {};
+                for (int j = 0; j < 7 && dot[j+1]; j++) ext[j] = (char)tolower((u8)dot[j+1]);
+                if (strcmp(ext,"htm") && strcmp(ext,"html") && strcmp(ext,"xhtml")) continue;
+                auto it = nm.find(href);
+                if (it == nm.end()) continue;
+                const ZipEntry& e = entries[it->second];
+                chapters.push_back({e.localOff, e.compSize, e.uncompSize, e.method});
+            }
+        }
+        // entries, nm, opf all freed here — heap has room for chapter HTML now
+
+        // Phase 2: read and strip chapters one at a time
         _words.clear();
         _currentBookPath = path;
         _playing = false;
         const int kMax = 100000;
-        for (const std::string& href : hrefs) {
+        for (const ChInfo& ch : chapters) {
             if ((int)_words.size() >= kMax) break;
-            auto hit = nm.find(href);
-            if (hit == nm.end()) continue;
+            ZipEntry tmp;
+            tmp.localOff   = ch.localOff;
+            tmp.compSize   = ch.compSize;
+            tmp.uncompSize = ch.uncompSize;
+            tmp.method     = ch.method;
             std::string html;
-            if (!zipReadEntry(f, entries[hit->second], html)) continue;
+            if (!zipReadEntry(f, tmp, html)) continue;
             htmlToWords(html, _words, kMax);
         }
         fclose(f);
