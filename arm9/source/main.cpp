@@ -1038,24 +1038,11 @@ class RSVPReaderApp : public Woopsi {
             char buf[64]; snprintf(buf, sizeof(buf), "%.60s", name);
             _bookLabel->setText(WoopsiString(buf));
 
-            // Restore saved position if the state file points at this book
-            int startWord = 0;
-            FILE* sf = fopen("/books/.state", "r");
-            if (sf) {
-                char spath[256] = {}; int sword = 0, swpm = 300;
-                bool ok = fgets(spath, sizeof(spath), sf) != nullptr;
-                if (ok) {
-                    int n = (int)strlen(spath);
-                    if (n > 0 && spath[n-1] == '\n') spath[--n] = 0;
-                    ok = (n > 0) && (fscanf(sf, "%d\n%d", &sword, &swpm) == 2);
-                }
-                fclose(sf);
-                if (ok && strcmp(spath, path) == 0) {
-                    startWord = std::min(sword, (int)_words.size() - 1);
-                    if (swpm >= 50 && swpm <= 1000) { _wpm = swpm; updateWpmLabel(); }
-                }
+            int startWord = 0, savedWpm = _wpm;
+            if (loadStateForBook(path, startWord, savedWpm)) {
+                startWord = std::max(0, std::min(startWord, (int)_words.size() - 1));
+                if (savedWpm >= 50 && savedWpm <= 1000) { _wpm = savedWpm; updateWpmLabel(); }
             }
-
             showWord(startWord);
             updateStatus("A to play");
         } else {
@@ -1063,27 +1050,81 @@ class RSVPReaderApp : public Woopsi {
         }
     }
 
+    // State file format: one line per book — "word wpm path\n"
+    // First line = last opened book (used for cold-start restore).
+
     void saveState() const {
-        FILE* f = fopen("/books/.state", "w");
-        if (!f) return;
-        fprintf(f, "%s\n%d\n%d\n", _currentBookPath.c_str(), _currentWord, _wpm);
+        if (_currentBookPath.empty()) return;
+        struct Entry { int word, wpm; char path[256]; };
+        std::vector<Entry> entries;
+        FILE* rf = fopen("/books/.state", "r");
+        if (rf) {
+            char line[320];
+            while (fgets(line, sizeof(line), rf)) {
+                Entry e = {};
+                if (sscanf(line, "%d %d %255[^\n]", &e.word, &e.wpm, e.path) == 3 && e.path[0])
+                    entries.push_back(e);
+            }
+            fclose(rf);
+        }
+        // Update existing entry or append
+        bool found = false;
+        for (auto& e : entries) {
+            if (strcmp(e.path, _currentBookPath.c_str()) == 0) {
+                e.word = _currentWord; e.wpm = _wpm; found = true; break;
+            }
+        }
+        if (!found) {
+            Entry e = {}; e.word = _currentWord; e.wpm = _wpm;
+            strncpy(e.path, _currentBookPath.c_str(), 255);
+            entries.push_back(e);
+        }
+        // Move current book to front so cold-start resumes it
+        for (int i = 1; i < (int)entries.size(); i++) {
+            if (strcmp(entries[i].path, _currentBookPath.c_str()) == 0) {
+                Entry tmp = entries[i];
+                entries.erase(entries.begin() + i);
+                entries.insert(entries.begin(), tmp);
+                break;
+            }
+        }
+        FILE* wf = fopen("/books/.state", "w");
+        if (!wf) return;
+        for (const auto& e : entries)
+            fprintf(wf, "%d %d %s\n", e.word, e.wpm, e.path);
+        fclose(wf);
+    }
+
+    bool loadStateForBook(const char* path, int& word, int& wpm) const {
+        FILE* f = fopen("/books/.state", "r");
+        if (!f) return false;
+        char line[320];
+        bool found = false;
+        while (fgets(line, sizeof(line), f)) {
+            int w = 0, m = 0; char p[256] = {};
+            if (sscanf(line, "%d %d %255[^\n]", &w, &m, p) == 3
+                && strcmp(p, path) == 0) {
+                word = w; wpm = m; found = true; break;
+            }
+        }
         fclose(f);
+        return found;
     }
 
     bool loadSavedState() {
         FILE* f = fopen("/books/.state", "r");
         if (!f) return false;
-        char path[256] = {}; int word = 0, wpm = 300;
-        bool ok = fgets(path, sizeof(path), f) != nullptr;
-        if (ok) {
-            int n = (int)strlen(path);
-            if (n > 0 && path[n-1] == '\n') path[--n] = 0;
-            ok = (n > 0) && (fscanf(f, "%d\n%d", &word, &wpm) == 2);
+        char line[320] = {};
+        bool found = false;
+        while (fgets(line, sizeof(line), f) && !found) {
+            int word = 0, wpm = 300; char path[256] = {};
+            if (sscanf(line, "%d %d %255[^\n]", &word, &wpm, path) == 3 && path[0]) {
+                _currentBookPath = path; _currentWord = word; _wpm = wpm;
+                found = true;
+            }
         }
         fclose(f);
-        if (!ok) return false;
-        _currentBookPath = path; _currentWord = word; _wpm = wpm;
-        return true;
+        return found;
     }
 
     static bool isBookFile(const char* n) {
