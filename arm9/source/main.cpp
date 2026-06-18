@@ -1373,9 +1373,11 @@ public:
         botWin->addGadget(_statusLabel);
         y += 12;
 
-        // ── Row 5: book list ──────────────────────────────────────────────────
+        // ── Row 5: book list + scroll buttons ────────────────────────────────
         _bookPaths = discoverBooks();
-        _bookList  = new ListBox(bot.x, y, bot.width, 64);
+        const s16 listH  = 64;
+        const s16 btnSW  = 18;  // scroll button width
+        _bookList = new ListBox(bot.x, y, bot.width - btnSW, listH);
         for (int i = 0; i < (int)_bookPaths.size(); i++) {
             const char* slash = strrchr(_bookPaths[i].c_str(), '/');
             const char* name  = slash ? slash + 1 : _bookPaths[i].c_str();
@@ -1391,7 +1393,20 @@ public:
             }
         ));
         botWin->addGadget(_bookList);
-        y += 66;
+
+        const s16 halfH = listH / 2;
+        auto scrollUp = new Button(bot.x + bot.width - btnSW, y, btnSW, halfH, "^");
+        scrollUp->setGadgetEventHandler(new GadgetCallback(
+            [this](Gadget&) { _bookList->scroll(0, _bookList->getOptionHeight()); }
+        ));
+        botWin->addGadget(scrollUp);
+
+        auto scrollDown = new Button(bot.x + bot.width - btnSW, y + halfH, btnSW, halfH, "v");
+        scrollDown->setGadgetEventHandler(new GadgetCallback(
+            [this](Gadget&) { _bookList->scroll(0, -(s32)_bookList->getOptionHeight()); }
+        ));
+        botWin->addGadget(scrollDown);
+        y += listH + 2;
 
         // ── Hints ─────────────────────────────────────────────────────────────
         auto hint = [&](const char* t) {
