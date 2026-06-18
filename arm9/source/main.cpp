@@ -110,7 +110,7 @@ class WordCanvas : public Gadget {
     int orpIndex() const {
         int n = (int)_word.getLength();
         if (n <= 2) return 0;
-        return (n * 35) / 100;
+        return n / 2;
     }
 
     int computeScale() const {
