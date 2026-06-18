@@ -1302,7 +1302,8 @@ public:
         _bottomScreen = new AmigaScreen("Controls", false, false);
         woopsiApplication->addGadget(_bottomScreen);
 
-        AmigaWindow* botWin = new AmigaWindow(0, 13, 256, 179, "Controls", false, false);
+        AmigaWindow* botWin = new AmigaWindow(0, 13, 256, 179, "", false, false);
+        botWin->setBorderless(true);
         _bottomScreen->addGadget(botWin);
 
         Rect bot; botWin->getClientRect(bot);
