@@ -618,6 +618,67 @@ static std::vector<std::string> epubSpineHrefs(const std::string& opf, const std
     return result;
 }
 
+// ── PDF text extraction ────────────────────────────────────────────────────────
+
+// Extract printable ASCII words from a raw PDF byte buffer (BT/ET text blocks).
+// Appends up to (limit - words.size()) words into `words`.
+static void pdfTextFromBuf(const char* buf, size_t len,
+                            std::vector<std::string>& words, int limit)
+{
+    const char* p   = buf;
+    const char* end = buf + len;
+    while (p < end && (int)words.size() < limit) {
+        // Find next BT marker
+        const char* bt = (const char*)memmem(p, (size_t)(end - p), "BT", 2);
+        if (!bt) break;
+        const char* et = (const char*)memmem(bt + 2, (size_t)(end - bt - 2), "ET", 2);
+        if (!et) break;
+        // Scan the BT..ET block for (string) Tj  and  [(str)] TJ
+        const char* q = bt + 2;
+        while (q < et) {
+            // skip whitespace
+            while (q < et && (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n')) q++;
+            if (q >= et) break;
+            if (*q == '(') {
+                // Collect chars inside parentheses (handles \\ and \) escapes)
+                q++;
+                std::string w;
+                while (q < et && *q != ')') {
+                    if (*q == '\\') {
+                        q++;
+                        if (q < et) { if ((u8)*q >= 32 && (u8)*q < 128) w += *q; q++; }
+                    } else {
+                        if ((u8)*q >= 32 && (u8)*q < 128) w += *q;
+                        q++;
+                    }
+                }
+                if (q < et) q++; // skip ')'
+                // Add non-empty words, splitting on space
+                if (!w.empty()) {
+                    const char* ws = w.c_str();
+                    while (*ws) {
+                        while (*ws == ' ') ws++;
+                        if (!*ws) break;
+                        const char* we = ws;
+                        while (*we && *we != ' ') we++;
+                        if (we > ws && (int)words.size() < limit)
+                            words.push_back(std::string(ws, (size_t)(we - ws)));
+                        ws = we;
+                    }
+                }
+            } else if (*q == '[') {
+                // TJ array — just advance past it, inner strings handled on next iteration
+                while (q < et && *q != ']') q++;
+                if (q < et) q++;
+            } else {
+                // Skip token
+                while (q < et && *q != ' ' && *q != '\t' && *q != '\r' && *q != '\n') q++;
+            }
+        }
+        p = et + 2;
+    }
+}
+
 // ── RSVPReaderApp ──────────────────────────────────────────────────────────────
 
 class RSVPReaderApp : public Woopsi {
@@ -760,27 +821,28 @@ class RSVPReaderApp : public Woopsi {
 
     // ── Book management ────────────────────────────────────────────────────────
 
+    // In-place punctuation consolidation — no second vector, no extra heap.
     void consolidatePunctuation() {
-        std::vector<std::string> out;
-        out.reserve(_words.size());
-        for (size_t i = 0; i < _words.size(); i++) {
-            const std::string& w = _words[i];
+        int w = 0;
+        for (int i = 0; i < (int)_words.size(); i++) {
             bool hasAlnum = false;
-            for (unsigned char c : w) { if (isalnum(c)) { hasAlnum = true; break; } }
+            for (unsigned char c : _words[i]) if (isalnum(c)) { hasAlnum = true; break; }
             if (hasAlnum) {
-                out.push_back(w);
+                if (w != i) _words[w] = std::move(_words[i]);
+                w++;
             } else {
-                const char first    = w.empty() ? 0 : w[0];
-                const bool isOpening = (first == '(' || first == '[' || first == '{');
-                if (isOpening && i + 1 < _words.size())
-                    _words[i + 1] = w + _words[i + 1];
-                else if (!out.empty())
-                    out.back() += w;
-                else if (i + 1 < _words.size())
-                    _words[i + 1] = w + _words[i + 1];
+                const char first = _words[i].empty() ? 0 : _words[i][0];
+                const bool isOpening = (first=='('||first=='['||first=='{');
+                if (isOpening && i+1 < (int)_words.size())
+                    _words[i+1] = _words[i] + _words[i+1];
+                else if (w > 0)
+                    _words[w-1] += _words[i];
+                else if (i+1 < (int)_words.size())
+                    _words[i+1] = _words[i] + _words[i+1];
             }
         }
-        _words = std::move(out);
+        _words.resize(w);
+        _words.shrink_to_fit();
     }
 
     bool loadBook(const char* path) {
@@ -789,6 +851,7 @@ class RSVPReaderApp : public Woopsi {
             char e[8] = {};
             for (int i = 0; i < 7 && ext[i+1]; i++) e[i] = (char)tolower((u8)ext[i+1]);
             if (strcmp(e, "epub") == 0) return loadEpub(path);
+            if (strcmp(e, "pdf")  == 0) return loadPdf(path);
         }
         return loadTxt(path);
     }
@@ -799,7 +862,8 @@ class RSVPReaderApp : public Woopsi {
         _words.clear();
         _currentBookPath = path;
         _playing = false;
-        static const int kMax = 100000;
+        static const int kMax = 40000;
+        _words.reserve(kMax);
         char line[512]; bool first = true;
         while (fgets(line, sizeof(line), f)) {
             const char* p = line;
@@ -879,7 +943,8 @@ class RSVPReaderApp : public Woopsi {
         _words.clear();
         _currentBookPath = path;
         _playing = false;
-        const int kMax = 100000;
+        const int kMax = 40000;
+        _words.reserve(kMax);
         for (const ChInfo& ch : chapters) {
             if ((int)_words.size() >= kMax) break;
             ZipEntry tmp;
@@ -892,6 +957,75 @@ class RSVPReaderApp : public Woopsi {
             htmlToWords(html, _words, kMax);
         }
         fclose(f);
+        if (!_words.empty()) consolidatePunctuation();
+        return !_words.empty();
+    }
+
+    bool loadPdf(const char* path) {
+        FILE* f = fopen(path, "rb");
+        if (!f) return false;
+
+        // Read up to 1 MB of the PDF into memory
+        static const int kRawMax = 1024 * 1024;
+        fseek(f, 0, SEEK_END);
+        long fsz = ftell(f);
+        rewind(f);
+        if (fsz <= 0) { fclose(f); return false; }
+        const int rawLen = (int)(fsz < kRawMax ? fsz : kRawMax);
+        char* raw = (char*)malloc((size_t)rawLen);
+        if (!raw) { fclose(f); return false; }
+        if ((int)fread(raw, 1, (size_t)rawLen, f) != rawLen) { free(raw); fclose(f); return false; }
+        fclose(f);
+
+        _words.clear();
+        _currentBookPath = path;
+        _playing = false;
+        static const int kMax = 40000;
+        _words.reserve(kMax);
+
+        // Scan for stream/endstream pairs; decompress FlateDecode streams with zlib
+        static const int kDecMax = 200 * 1024;
+        char* dec = (char*)malloc((size_t)kDecMax);
+        if (!dec) { free(raw); return false; }
+
+        const char* p   = raw;
+        const char* end = raw + rawLen;
+        while (p < end && (int)_words.size() < kMax) {
+            const char* sm = (const char*)memmem(p, (size_t)(end - p), "stream", 6);
+            if (!sm) break;
+            // stream keyword must be followed by \r\n or \n
+            const char* sd = sm + 6;
+            if (sd < end && *sd == '\r') sd++;
+            if (sd >= end || *sd != '\n') { p = sm + 6; continue; }
+            sd++;
+
+            const char* em = (const char*)memmem(sd, (size_t)(end - sd), "endstream", 9);
+            if (!em) break;
+
+            // Check if the dictionary preceding "stream" contains /FlateDecode
+            const char* dictStart = (sm > raw + 256) ? sm - 256 : raw;
+            bool isFlate = (memmem(dictStart, (size_t)(sm - dictStart), "FlateDecode", 11) != nullptr);
+
+            if (isFlate) {
+                uLongf decLen = (uLongf)kDecMax;
+                z_stream z = {};
+                z.next_in  = (Bytef*)sd;
+                z.avail_in = (uInt)(em - sd);
+                z.next_out = (Bytef*)dec;
+                z.avail_out= (uInt)kDecMax;
+                if (inflateInit(&z) == Z_OK) {
+                    inflate(&z, Z_FINISH);
+                    decLen = (uLongf)(kDecMax - (int)z.avail_out);
+                    inflateEnd(&z);
+                    pdfTextFromBuf(dec, (size_t)decLen, _words, kMax);
+                }
+            } else {
+                pdfTextFromBuf(sd, (size_t)(em - sd), _words, kMax);
+            }
+            p = em + 9;
+        }
+        free(dec);
+        free(raw);
         if (!_words.empty()) consolidatePunctuation();
         return !_words.empty();
     }
@@ -941,6 +1075,9 @@ class RSVPReaderApp : public Woopsi {
         if (l > 5 && n[l-5]=='.' &&
             tolower((u8)n[l-4])=='e' && tolower((u8)n[l-3])=='p' &&
             tolower((u8)n[l-2])=='u' && tolower((u8)n[l-1])=='b')
+            return true;
+        if (l > 4 && n[l-4]=='.' &&
+            tolower((u8)n[l-3])=='p' && tolower((u8)n[l-2])=='d' && tolower((u8)n[l-1])=='f')
             return true;
         return false;
     }
