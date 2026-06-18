@@ -85,6 +85,8 @@ class WordCanvas : public Gadget {
     bool                            _browseMode = false;
     const std::vector<std::string>* _wordList   = nullptr;
     int                             _browseIdx  = 0;
+    int                             _prevBrowseIdx  = -1; // word highlighted on last draw
+    int                             _prevFirstLine  = -1; // first visible line on last draw
 
     // ── Shared ─────────────────────────────────────────────────────────────────
     u16      _bgColour;
@@ -129,25 +131,6 @@ class WordCanvas : public Gadget {
                         xCur + (s16)(runStart * scale),
                         y0   + (s16)(py * scale),
                         (u16)((px - runStart) * scale), (u16)scale, fg);
-                    runStart = -1;
-                }
-            }
-        }
-    }
-
-    // Render one glyph at native scale (1×) — same technique, height = 1 px.
-    void blitNative(GraphicsPort* port, u8 cw, u8 fontH,
-                    s16 xCur, s16 y, u16 fg) const {
-        for (int py = 0; py < (int)fontH; py++) {
-            int runStart = -1;
-            for (int px = 0; px <= (int)cw; px++) {
-                const bool lit = (px < (int)cw) &&
-                                 (_charBuf[py * kBufW + px] != _bgColour);
-                if (lit && runStart < 0) {
-                    runStart = px;
-                } else if (!lit && runStart >= 0) {
-                    port->drawFilledRect(xCur + (s16)runStart, y + (s16)py,
-                                         (u16)(px - runStart), 1, fg);
                     runStart = -1;
                 }
             }
@@ -199,84 +182,112 @@ class WordCanvas : public Gadget {
     }
 
     // ── Browse rendering ────────────────────────────────────────────────────────
-    // Shows 3 lines of context at native Batang14 scale, current word in red.
+    // Fills the full screen with word-wrapped book context.  The current word
+    // is drawn in red; all other text uses _fgColour.
+    //
+    // Uses GraphicsPort::drawText for text — one call per word, orders of
+    // magnitude faster than the per-character FrameBuffer path used in RSVP
+    // mode.  Combines two strategies to eliminate flickering:
+    //
+    //   • Full redraw (first draw or line window shifted): single DMA bg-fill
+    //     followed by drawText for every visible word.
+    //   • Partial update (same lines, only the highlighted word changed): only
+    //     the previously- and newly-highlighted words are cleared and redrawn
+    //     — typically 4 Woopsi calls total.
 
     void drawBrowse(GraphicsPort* port) {
-        const u16 kRed = woopsiRGB(31, 0, 0);
+        const u16 kRed  = woopsiRGB(31, 0, 0);
+        const u8  fontH = _font.getHeight();
+        const int lineH = (int)fontH + 3;          // 3-px leading between lines
+        const int spW   = (int)_font.getCharWidth((u32)' ');
+        const int W     = getWidth();
+        const int H     = getHeight();
+        const int N     = (int)_wordList->size();
+        const int kShow = H / lineH;               // lines that fit on screen
 
-        port->drawFilledRect(0, 0, getWidth(), getHeight(), _bgColour);
-        if (!_wordList || _wordList->empty()) return;
+        if (kShow < 1 || N == 0) return;
 
-        const u8  fontH  = _font.getHeight();
-        const int lineH  = (int)fontH + 3;
-        const int spaceW = (int)_font.getCharWidth((u32)' ');
-        const int W      = getWidth();
-        const int nWords = (int)_wordList->size();
+        // ── Word-wrap layout ──────────────────────────────────────────────────
+        const int scanStart = std::max(0, _browseIdx - 300);
+        const int scanEnd   = std::min(N, _browseIdx + 300);
 
-        // Build a word-wrap layout over a window around _browseIdx.
-        int scanStart = std::max(0, _browseIdx - 150);
-        int scanEnd   = std::min(nWords, _browseIdx + 150);
-
-        // lineEnds[l] = exclusive-end word index for line l; line l starts at
-        // lineEnds[l-1] (or scanStart for l==0).
-        std::vector<int> lineEnds;
-        lineEnds.reserve(32);
-        int lineW = 0;
-
+        std::vector<int> lineEnds;  // lineEnds[l] = exclusive end of line l
+        lineEnds.reserve(kShow * 3);
+        int lw = 0;
         for (int i = scanStart; i < scanEnd; i++) {
             int ww = 0;
-            for (unsigned char c : (*_wordList)[i])
-                ww += (int)_font.getCharWidth((u32)c);
-            if (lineW > 0 && lineW + spaceW + ww > W) {
-                lineEnds.push_back(i);
-                lineW = ww;
-            } else {
-                lineW += (lineW > 0 ? spaceW : 0) + ww;
-            }
+            for (unsigned char c : (*_wordList)[i]) ww += (int)_font.getCharWidth((u32)c);
+            if (lw > 0 && lw + spW + ww > W) { lineEnds.push_back(i); lw = ww; }
+            else                              { lw += (lw > 0 ? spW : 0) + ww; }
         }
         lineEnds.push_back(scanEnd);
 
-        // Find which line holds _browseIdx.
-        int curLine = 0;
-        int lStart  = scanStart;
+        // ── Find current line ─────────────────────────────────────────────────
+        int curLine = 0, ls = scanStart;
         for (int l = 0; l < (int)lineEnds.size(); l++) {
-            if (_browseIdx >= lStart && _browseIdx < lineEnds[l]) { curLine = l; break; }
-            lStart = lineEnds[l];
+            if (_browseIdx >= ls && _browseIdx < lineEnds[l]) { curLine = l; break; }
+            ls = lineEnds[l];
         }
 
-        // Show [curLine-1, curLine, curLine+1] (3 lines, vertically centred).
-        const int kShow = 3;
-        int first = std::max(0, curLine - 1);
+        // ── Choose visible window (current line centred) ───────────────────────
+        int first = std::max(0, curLine - kShow / 2);
         int last  = std::min((int)lineEnds.size() - 1, first + kShow - 1);
         first     = std::max(0, last - kShow + 1);
+        const int visLines = last - first + 1;
+        const s16 yBase    = (s16)((H - visLines * lineH) / 2);
 
-        const s16 yBase = (s16)((getHeight() - kShow * lineH) / 2);
+        // ── Diff with previous draw ───────────────────────────────────────────
+        const int prevFirst = _prevFirstLine;
+        const int prevIdx   = _prevBrowseIdx;
+        _prevFirstLine = first;
+        _prevBrowseIdx = _browseIdx;
 
-        // Render lines first..last
-        lStart = scanStart;
+        const bool firstDraw  = (prevFirst < 0);
+        const bool viewShifted= firstDraw || (first != prevFirst);
+
+        if (viewShifted) {
+            // Full clear — single DMA fill, very fast
+            port->drawFilledRect(0, 0, (u16)W, (u16)H, _bgColour);
+        }
+
+        // ── Render visible lines ──────────────────────────────────────────────
+        ls = scanStart;
         for (int l = 0; l < (int)lineEnds.size(); l++) {
-            int lEnd = lineEnds[l];
+            const int lEnd = lineEnds[l];
             if (l >= first && l <= last) {
-                const s16 y = yBase + (s16)((l - first) * lineH);
+                const s16 lineY = yBase + (s16)((l - first) * lineH);
                 s16 x = 0;
-                for (int wi = lStart; wi < lEnd; wi++) {
-                    if (wi > lStart) x += (s16)spaceW;
-                    const std::string& word = (*_wordList)[wi];
-                    const u16 fg = (wi == _browseIdx) ? kRed : _fgColour;
+                for (int wi = ls; wi < lEnd; wi++) {
+                    if (wi > ls) x += (s16)spW;
 
-                    FrameBuffer fb(_charBuf, (u16)kBufW, (u16)fontH);
-                    for (unsigned char c : word) {
-                        const u8 cw = _font.getCharWidth((u32)c);
-                        fb.blitFill(0, 0, _bgColour, (u32)kBufW * (u32)fontH);
-                        _font.drawChar(&fb, (u32)c, fg, 0, 0,
-                                       0, 0, (u16)(cw - 1), (u16)(fontH - 1));
-                        blitNative(port, cw, fontH, x, y, fg);
-                        x += (s16)cw;
+                    // Measure word pixel width (needed for x advancement and
+                    // for the partial-update background clear).
+                    int ww = 0;
+                    for (unsigned char c : (*_wordList)[wi])
+                        ww += (int)_font.getCharWidth((u32)c);
+
+                    const bool wasHl   = (!firstDraw && wi == prevIdx);
+                    const bool isHl    = (wi == _browseIdx);
+                    const bool needDraw= viewShifted || wasHl || isHl;
+
+                    if (needDraw) {
+                        const u16 fg = isHl ? kRed : _fgColour;
+                        if (!viewShifted) {
+                            // Partial update: clear only this word's rect so
+                            // the colour change doesn't ghost over old pixels.
+                            port->drawFilledRect(x, lineY, (u16)ww, (u16)fontH, _bgColour);
+                        }
+                        // drawText renders transparent background — one call
+                        // per word, internally optimised by Woopsi.
+                        port->drawText(x, lineY, &_font,
+                                       WoopsiString((*_wordList)[wi].c_str()),
+                                       0, (s32)(*_wordList)[wi].size(), fg);
                     }
+                    x += (s16)ww;
                 }
             }
-            lStart = lEnd;
-            if (l >= last) break;
+            ls = lEnd;
+            if (l > last) break;
         }
     }
 
@@ -301,9 +312,11 @@ public:
 
     // Browse mode
     void setBrowse(bool on, const std::vector<std::string>* words, int idx) {
-        _browseMode = on;
-        _wordList   = words;
-        _browseIdx  = idx;
+        _browseMode    = on;
+        _wordList      = words;
+        _browseIdx     = idx;
+        _prevBrowseIdx = -1;   // force full redraw on first browse frame
+        _prevFirstLine = -1;
         markRectsDamaged();
     }
     void setBrowseIdx(int idx) {
@@ -355,6 +368,7 @@ class RSVPReaderApp : public Woopsi {
     u32         _wordStartVBL  = 0;
     u32         _lrHeldSince   = 0;      // frame when L/R was first pressed
     u32         _lrLastRepeat  = 0;      // frame of last repeat step
+    u32         _browseLingerEnd = 0;    // frame at which to exit browse (0=inactive)
     std::string _currentBookPath;
     std::vector<std::string> _bookPaths;
 
@@ -603,8 +617,15 @@ class RSVPReaderApp : public Woopsi {
 
     void handleVBL() override {
         Woopsi::handleVBL();
-        // RSVP auto-advance is suspended during browse mode so the user can
-        // navigate freely without the position jumping under their thumb.
+
+        // Linger: exit browse mode ~0.5 s after releasing the scroll key.
+        if (_browseLingerEnd > 0 && _vblCount >= _browseLingerEnd) {
+            _browseLingerEnd = 0;
+            exitBrowse();
+        }
+
+        // RSVP auto-advance is suspended during browse so the user can navigate
+        // freely without the position jumping under their thumb.
         if (!_playing || _words.empty() || _browseMode) return;
         u32 frames = (u32)std::max(1, wordDurationMs() * 60 / 1000);
         if ((_vblCount - _wordStartVBL) >= frames) advanceWord();
@@ -642,20 +663,25 @@ class RSVPReaderApp : public Woopsi {
         // After the initial hold delay (~333 ms = 20 frames), the word advances
         // every 5 frames (~83 ms) and browse mode activates.
         if (down & (KEY_LEFT | KEY_RIGHT)) {
-            _lrHeldSince  = _vblCount;
-            _lrLastRepeat = _vblCount;
+            _lrHeldSince     = _vblCount;
+            _lrLastRepeat    = _vblCount;
+            _browseLingerEnd = 0;          // cancel any pending linger exit
             showWord(_currentWord + ((down & KEY_RIGHT) ? 1 : -1));
         } else if (held & (KEY_LEFT | KEY_RIGHT)) {
-            const u32 heldFor   = _vblCount - _lrHeldSince;
-            const u32 sinceRep  = _vblCount - _lrLastRepeat;
+            const u32 heldFor  = _vblCount - _lrHeldSince;
+            const u32 sinceRep = _vblCount - _lrLastRepeat;
             if (heldFor >= 20 && sinceRep >= 5) {
-                _lrLastRepeat = _vblCount;
+                _lrLastRepeat    = _vblCount;
+                _browseLingerEnd = 0;      // keep linger clock reset while held
                 showWord(_currentWord + ((held & KEY_RIGHT) ? 1 : -1));
                 if (!_browseMode) enterBrowse();
             }
         }
-        // Return to RSVP mode as soon as the directional key is released.
-        if ((up & (KEY_LEFT | KEY_RIGHT)) && _browseMode) exitBrowse();
+        // Key released: start linger countdown (~0.5 s = 30 frames) so the
+        // browse view stays visible briefly before snapping back to RSVP.
+        if ((up & (KEY_LEFT | KEY_RIGHT)) && _browseMode && _browseLingerEnd == 0) {
+            _browseLingerEnd = _vblCount + 30;
+        }
 
         // Y — theme toggle
         if (down & KEY_Y) toggleTheme();
