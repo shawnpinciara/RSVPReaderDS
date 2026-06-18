@@ -13,11 +13,11 @@
 //   B              — Rewind to start of current sentence
 //   L              — Decrease WPM (−25, min 50)
 //   R              — Increase WPM (+25, max 1000)
-//   D-pad Up/Down  — Jump ±10 words
+//   D-pad Up/Down  — Page up/down in browse mode; enter browse on first press
 //   D-pad L/R      — Step 1 word; hold for continuous scroll + browse view
 //   Y              — Toggle dark / light theme
 //   X              — Font size −1×
-//   Start          — Save state to /book/.state
+//   Start          — Save state to /books/.state
 //   Select         — Load highlighted book
 //   Start + Select — Quit
 
@@ -36,11 +36,14 @@
 #include <gadgeteventhandler.h>
 #include "fonts/batang14.h"
 
+#include <zlib.h>
+
 #include <cctype>
 #include <cstdio>
 #include <cstring>
 #include <algorithm>
 #include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -367,6 +370,58 @@ public:
     int getMaxScale() const { return _maxScale; }
 
     // Theme
+    // Lay out _pageEndWord without drawing, so pageForward() works on first press
+    void layoutCurrentPage() {
+        if (!_wordList || _pageEndWord > 0) return;
+        const int spW   = (int)_font.getCharWidth((u32)' ');
+        const int W     = getWidth();
+        const int lineH = (int)_font.getHeight() + 3;
+        const int kShow = getHeight() / lineH;
+        const int N     = (int)_wordList->size();
+        int lw = 0, lineCount = 1;
+        for (int i = _pageStartWord; i < N; i++) {
+            int ww = 0;
+            for (unsigned char c : (*_wordList)[i]) ww += (int)_font.getCharWidth((u32)c);
+            if (lw > 0 && lw + spW + ww > W) {
+                if (lineCount >= kShow) { _pageEndWord = i; return; }
+                lineCount++; lw = ww;
+            } else { lw += (lw > 0 ? spW : 0) + ww; }
+        }
+        _pageEndWord = N;
+    }
+
+    // Jump to the next page; returns new _browseIdx for caller to sync.
+    int pageForward() {
+        if (!_wordList) return _browseIdx;
+        layoutCurrentPage();
+        const int N = (int)_wordList->size();
+        if (_pageEndWord > 0 && _pageEndWord < N) {
+            _pageStartWord = _pageEndWord;
+            _browseIdx     = _pageStartWord;
+            _pageEndWord   = 0;
+            _pageDirty     = true;
+            _prevBrowseIdx = -1;
+        } else {
+            _browseIdx = N - 1;
+        }
+        markRectsDamaged();
+        return _browseIdx;
+    }
+
+    // Jump to the previous page; returns new _browseIdx.
+    int pageBackward() {
+        if (!_wordList) return _browseIdx;
+        if (_pageStartWord == 0) { _browseIdx = 0; markRectsDamaged(); return 0; }
+        const int prevStart = findPageStartBefore(_pageStartWord);
+        _pageStartWord = prevStart;
+        _browseIdx     = prevStart;
+        _pageEndWord   = 0;
+        _pageDirty     = true;
+        _prevBrowseIdx = -1;
+        markRectsDamaged();
+        return _browseIdx;
+    }
+
     void setTheme(bool lightMode) {
         _bgColour = lightMode ? woopsiRGB(31, 31, 31) : woopsiRGB(0, 0, 0);
         _fgColour = lightMode ? woopsiRGB(0, 0, 0)   : woopsiRGB(31, 31, 31);
@@ -377,6 +432,175 @@ public:
 };
 
 u16 WordCanvas::_charBuf[WordCanvas::kBufW * WordCanvas::kBufH];
+
+// ── EPUB / ZIP helpers ────────────────────────────────────────────────────────
+// Minimal ZIP + HTML stripper; handles stored (method=0) and deflate (method=8).
+
+struct ZipEntry {
+    std::string name;
+    u32 localOff, compSize, uncompSize;
+    u16 method;
+};
+
+static bool zipParseCentralDir(FILE* f, std::vector<ZipEntry>& out) {
+    fseek(f, 0, SEEK_END);
+    const long fsz = ftell(f);
+    long eocd = -1;
+    for (long i = fsz - 22; i >= std::max(0L, fsz - 22 - 65535L); i--) {
+        fseek(f, i, SEEK_SET);
+        u32 sig = 0; fread(&sig, 4, 1, f);
+        if (sig == 0x06054b50) { eocd = i; break; }
+    }
+    if (eocd < 0) return false;
+    u16 numEntries; u32 cdOffset;
+    fseek(f, eocd + 10, SEEK_SET); fread(&numEntries, 2, 1, f);
+    fseek(f, eocd + 16, SEEK_SET); fread(&cdOffset,   4, 1, f);
+    fseek(f, (long)cdOffset, SEEK_SET);
+    out.reserve(numEntries);
+    for (int i = 0; i < numEntries; i++) {
+        u32 sig = 0; fread(&sig, 4, 1, f);
+        if (sig != 0x02014b50) break;
+        u16 method;
+        fseek(f, 6, SEEK_CUR);
+        fread(&method, 2, 1, f);
+        fseek(f, 8, SEEK_CUR);
+        u32 cs, us; fread(&cs, 4, 1, f); fread(&us, 4, 1, f);
+        u16 nl, el, cl;
+        fread(&nl, 2, 1, f); fread(&el, 2, 1, f); fread(&cl, 2, 1, f);
+        fseek(f, 8, SEEK_CUR);
+        u32 lo; fread(&lo, 4, 1, f);
+        ZipEntry e; e.name.resize(nl); fread(&e.name[0], 1, nl, f);
+        fseek(f, el + cl, SEEK_CUR);
+        e.localOff = lo; e.compSize = cs; e.uncompSize = us; e.method = method;
+        out.push_back(std::move(e));
+    }
+    return !out.empty();
+}
+
+static bool zipReadEntry(FILE* f, const ZipEntry& e, std::string& out) {
+    fseek(f, (long)e.localOff + 26, SEEK_SET);
+    u16 nl, el; fread(&nl, 2, 1, f); fread(&el, 2, 1, f);
+    fseek(f, nl + el, SEEK_CUR);
+    if (e.method == 0) {
+        out.resize(e.uncompSize);
+        return fread(&out[0], 1, e.uncompSize, f) == e.uncompSize;
+    }
+    if (e.method != 8) return false;
+    std::vector<u8> comp(e.compSize);
+    if (fread(comp.data(), 1, e.compSize, f) != e.compSize) return false;
+    out.resize(e.uncompSize);
+    z_stream z = {};
+    z.next_in   = comp.data();
+    z.avail_in  = e.compSize;
+    z.next_out  = reinterpret_cast<u8*>(&out[0]);
+    z.avail_out = e.uncompSize;
+    if (inflateInit2(&z, -15) != Z_OK) return false;
+    int r = inflate(&z, Z_FINISH);
+    inflateEnd(&z);
+    return r == Z_STREAM_END;
+}
+
+// Return value of attribute `attr` within the range [tagP, tagEnd).
+static std::string attrVal(const char* tagP, const char* tagEnd, const char* attr) {
+    char needle[64]; snprintf(needle, sizeof(needle), " %s=\"", attr);
+    const int nlen = (int)strlen(needle);
+    for (const char* p = tagP; p < tagEnd - nlen; p++) {
+        if (strncmp(p, needle, nlen) == 0) {
+            const char* v = p + nlen;
+            const char* e = v;
+            while (e < tagEnd && *e != '"') e++;
+            return std::string(v, e - v);
+        }
+    }
+    return "";
+}
+
+// Strip HTML tags and decode basic entities; append to word list.
+static void htmlToWords(const std::string& html, std::vector<std::string>& words, int maxW) {
+    const char* p   = html.c_str();
+    const char* end = p + html.size();
+    std::string tok;
+    bool skip = false;  // inside <script> or <style>
+    auto flush = [&]() {
+        if (!tok.empty() && (int)words.size() < maxW) { words.push_back(tok); tok.clear(); }
+    };
+    while (p < end && (int)words.size() < maxW) {
+        if (*p == '<') {
+            flush();
+            const char* ts = p + 1;
+            bool closing = (ts < end && *ts == '/');
+            if (closing) ts++;
+            while (ts < end && *ts == ' ') ts++;
+            char tn[16] = {}; int tnl = 0;
+            while (ts < end && *ts != ' ' && *ts != '>' && *ts != '/' && tnl < 15)
+                tn[tnl++] = (char)tolower((u8)*ts++);
+            while (p < end && *p != '>') p++;
+            if (p < end) p++;
+            if (!closing && (strcmp(tn,"script")==0 || strcmp(tn,"style")==0)) skip = true;
+            else if (closing && (strcmp(tn,"script")==0 || strcmp(tn,"style")==0)) skip = false;
+        } else if (skip) {
+            p++;
+        } else if (*p == '&') {
+            const char* s = ++p;
+            while (p < end && *p != ';' && *p != '<' && (p - s) < 8) p++;
+            if (p < end && *p == ';') {
+                std::string ent(s, p - s); p++;
+                if      (ent=="amp")  tok += '&';
+                else if (ent=="lt")   tok += '<';
+                else if (ent=="gt")   tok += '>';
+                else if (ent=="quot") tok += '"';
+                else if (ent=="apos") tok += '\'';
+                else tok += ' ';
+            }
+        } else if ((u8)*p <= 32) {
+            flush(); p++;
+        } else {
+            if ((u8)*p >= 32 && (u8)*p < 128) tok += *p;
+            p++;
+        }
+    }
+    flush();
+}
+
+static std::string opfPathFrom(const std::string& xml) {
+    const char* needle = "full-path=\"";
+    const char* p = strstr(xml.c_str(), needle);
+    if (!p) return "";
+    p += strlen(needle);
+    const char* e = strchr(p, '"');
+    return e ? std::string(p, e - p) : "";
+}
+
+static std::vector<std::string> epubSpineHrefs(const std::string& opf, const std::string& dir) {
+    std::map<std::string, std::string> idHref;
+    const char* p = opf.c_str();
+    while ((p = strstr(p, "<item ")) != nullptr) {
+        const char* te = strchr(p, '>');
+        if (!te) break;
+        std::string id   = attrVal(p, te, "id");
+        std::string href = attrVal(p, te, "href");
+        if (!id.empty() && !href.empty()) {
+            size_t h = href.find('#'); if (h != std::string::npos) href = href.substr(0, h);
+            idHref[id] = dir + href;
+        }
+        p = te + 1;
+    }
+    std::vector<std::string> result;
+    const char* spine    = strstr(opf.c_str(), "<spine");
+    const char* spineEnd = spine ? strstr(spine, "</spine>") : nullptr;
+    if (!spine) { for (auto& kv : idHref) result.push_back(kv.second); return result; }
+    if (!spineEnd) spineEnd = opf.c_str() + opf.size();
+    p = spine;
+    while (p < spineEnd && (p = strstr(p, "<itemref ")) != nullptr && p < spineEnd) {
+        const char* te = strchr(p, '>');
+        if (!te || te > spineEnd) break;
+        std::string idref = attrVal(p, te, "idref");
+        auto it = idHref.find(idref);
+        if (it != idHref.end()) result.push_back(it->second);
+        p = te + 1;
+    }
+    return result;
+}
 
 // ── RSVPReaderApp ──────────────────────────────────────────────────────────────
 
@@ -402,8 +626,10 @@ class RSVPReaderApp : public Woopsi {
     bool        _lightMode     = false;
     bool        _browseMode    = false;   // true while D-pad L/R is held
     u32         _wordStartVBL  = 0;
-    u32         _lrHeldSince   = 0;      // frame when L/R was first pressed
-    u32         _lrLastRepeat  = 0;      // frame of last repeat step
+    u32         _lrHeldSince   = 0;
+    u32         _lrLastRepeat  = 0;
+    u32         _udHeldSince   = 0;      // frame when Up/Down was first pressed
+    u32         _udLastRepeat  = 0;      // frame of last Up/Down repeat
     u32         _browseLingerEnd = 0;    // frame at which to exit browse (0=inactive)
     std::string _currentBookPath;
     std::vector<std::string> _bookPaths;
@@ -541,6 +767,16 @@ class RSVPReaderApp : public Woopsi {
     }
 
     bool loadBook(const char* path) {
+        const char* ext = strrchr(path, '.');
+        if (ext) {
+            char e[8] = {};
+            for (int i = 0; i < 7 && ext[i+1]; i++) e[i] = (char)tolower((u8)ext[i+1]);
+            if (strcmp(e, "epub") == 0) return loadEpub(path);
+        }
+        return loadTxt(path);
+    }
+
+    bool loadTxt(const char* path) {
         FILE* f = fopen(path, "r");
         if (!f) return false;
         _words.clear();
@@ -573,6 +809,50 @@ class RSVPReaderApp : public Woopsi {
         return !_words.empty();
     }
 
+    bool loadEpub(const char* path) {
+        FILE* f = fopen(path, "rb");
+        if (!f) return false;
+        std::vector<ZipEntry> entries;
+        if (!zipParseCentralDir(f, entries)) { fclose(f); return false; }
+        std::map<std::string, int> nm;
+        for (int i = 0; i < (int)entries.size(); i++) nm[entries[i].name] = i;
+
+        auto it = nm.find("META-INF/container.xml");
+        if (it == nm.end()) { fclose(f); return false; }
+        std::string container;
+        if (!zipReadEntry(f, entries[it->second], container)) { fclose(f); return false; }
+
+        std::string opfPath = opfPathFrom(container);
+        if (opfPath.empty()) { fclose(f); return false; }
+
+        auto it2 = nm.find(opfPath);
+        if (it2 == nm.end()) { fclose(f); return false; }
+        std::string opf;
+        if (!zipReadEntry(f, entries[it2->second], opf)) { fclose(f); return false; }
+
+        std::string opfDir;
+        size_t sl = opfPath.rfind('/');
+        if (sl != std::string::npos) opfDir = opfPath.substr(0, sl + 1);
+
+        std::vector<std::string> hrefs = epubSpineHrefs(opf, opfDir);
+
+        _words.clear();
+        _currentBookPath = path;
+        _playing = false;
+        const int kMax = 100000;
+        for (const std::string& href : hrefs) {
+            if ((int)_words.size() >= kMax) break;
+            auto hit = nm.find(href);
+            if (hit == nm.end()) continue;
+            std::string html;
+            if (!zipReadEntry(f, entries[hit->second], html)) continue;
+            htmlToWords(html, _words, kMax);
+        }
+        fclose(f);
+        if (!_words.empty()) consolidatePunctuation();
+        return !_words.empty();
+    }
+
     void loadAndShowBook(const char* path) {
         updateStatus("Loading...");
         if (loadBook(path)) {
@@ -588,14 +868,14 @@ class RSVPReaderApp : public Woopsi {
     }
 
     void saveState() const {
-        FILE* f = fopen("/book/.state", "w");
+        FILE* f = fopen("/books/.state", "w");
         if (!f) return;
         fprintf(f, "%s\n%d\n%d\n", _currentBookPath.c_str(), _currentWord, _wpm);
         fclose(f);
     }
 
     bool loadSavedState() {
-        FILE* f = fopen("/book/.state", "r");
+        FILE* f = fopen("/books/.state", "r");
         if (!f) return false;
         char path[256] = {}; int word = 0, wpm = 300;
         bool ok = fgets(path, sizeof(path), f) != nullptr;
@@ -610,27 +890,33 @@ class RSVPReaderApp : public Woopsi {
         return true;
     }
 
-    static bool hasTxt(const char* n) {
+    static bool isBookFile(const char* n) {
         int l = (int)strlen(n);
-        return l > 4 && n[l-4]=='.' &&
-               tolower((u8)n[l-3])=='t' && tolower((u8)n[l-2])=='x' && tolower((u8)n[l-1])=='t';
+        if (l > 4 && n[l-4]=='.' &&
+            tolower((u8)n[l-3])=='t' && tolower((u8)n[l-2])=='x' && tolower((u8)n[l-1])=='t')
+            return true;
+        if (l > 5 && n[l-5]=='.' &&
+            tolower((u8)n[l-4])=='e' && tolower((u8)n[l-3])=='p' &&
+            tolower((u8)n[l-2])=='u' && tolower((u8)n[l-1])=='b')
+            return true;
+        return false;
     }
 
     std::vector<std::string> discoverBooks() const {
         std::vector<std::string> v;
-        DIR* d = opendir("/book");
+        DIR* d = opendir("/books");
         if (!d) return v;
         struct dirent* e;
         while ((e = readdir(d)) != nullptr)
-            if (e->d_name[0] != '.' && hasTxt(e->d_name))
-                v.push_back(std::string("/book/") + e->d_name);
+            if (e->d_name[0] != '.' && isBookFile(e->d_name))
+                v.push_back(std::string("/books/") + e->d_name);
         closedir(d);
         std::sort(v.begin(), v.end());
         return v;
     }
 
     void tryLoadSelectedBook() {
-        if (_bookPaths.empty()) { updateStatus("No .txt in /book/"); return; }
+        if (_bookPaths.empty()) { updateStatus("No books in /books/"); return; }
         s32 idx = _bookList ? _bookList->getSelectedIndex() : 0;
         if (idx < 0) idx = 0;
         if (idx < (s32)_bookPaths.size())
@@ -691,9 +977,35 @@ class RSVPReaderApp : public Woopsi {
         if (down & KEY_L) { _wpm = std::max(50,   _wpm - 25); updateWpmLabel(); }
         if (down & KEY_R) { _wpm = std::min(1000, _wpm + 25); updateWpmLabel(); }
 
-        // Up / Down — jump ±10 words
-        if (down & KEY_UP)   showWord(_currentWord + 10);
-        if (down & KEY_DOWN) showWord(_currentWord - 10);
+        // Up / Down — page navigation (browse mode) or ±10 words (RSVP mode)
+        if (down & (KEY_UP | KEY_DOWN)) {
+            _udHeldSince     = _vblCount;
+            _udLastRepeat    = _vblCount;
+            _browseLingerEnd = 0;
+            if (!_browseMode) enterBrowse();
+            _currentWord  = (down & KEY_DOWN) ? _wordCanvas->pageForward()
+                                               : _wordCanvas->pageBackward();
+            _wordStartVBL = _vblCount;
+            char buf[56]; int total = (int)_words.size();
+            snprintf(buf, sizeof(buf), "%d / %d", _currentWord + 1, total);
+            _progressLabel->setText(WoopsiString(buf));
+        } else if (held & (KEY_UP | KEY_DOWN)) {
+            const u32 heldFor  = _vblCount - _udHeldSince;
+            const u32 sinceRep = _vblCount - _udLastRepeat;
+            if (heldFor >= 20 && sinceRep >= 8) {
+                _udLastRepeat    = _vblCount;
+                _browseLingerEnd = 0;
+                _currentWord  = (held & KEY_DOWN) ? _wordCanvas->pageForward()
+                                                   : _wordCanvas->pageBackward();
+                _wordStartVBL = _vblCount;
+                char buf[56]; int total = (int)_words.size();
+                snprintf(buf, sizeof(buf), "%d / %d", _currentWord + 1, total);
+                _progressLabel->setText(WoopsiString(buf));
+            }
+        }
+        if ((up & (KEY_UP | KEY_DOWN)) && _browseMode && _browseLingerEnd == 0) {
+            _browseLingerEnd = _vblCount + 30;
+        }
 
         // Left / Right — single step on press; continuous scroll when held.
         // After the initial hold delay (~333 ms = 20 frames), the word advances
@@ -824,7 +1136,7 @@ public:
             _bookList->addOption(WoopsiString(name), (u32)i);
         }
         if (_bookPaths.empty())
-            _bookList->addOption(WoopsiString("(no .txt files in /book/)"), 0);
+            _bookList->addOption(WoopsiString("(no books in /books/)"), 0);
         _bookList->setGadgetEventHandler(new GadgetCallback(
             [this](Gadget& g) {
                 s32 idx = static_cast<ListBox&>(g).getSelectedIndex();
@@ -858,7 +1170,7 @@ public:
                 updateStatus("A to load book");
             }
         } else {
-            updateStatus(_bookPaths.empty() ? "Put .txt in /book/" : "Tap book then A");
+            updateStatus(_bookPaths.empty() ? "Put books in /books/" : "Tap book then A");
         }
     }
 };

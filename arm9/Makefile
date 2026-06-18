@@ -19,8 +19,8 @@ CXXFLAGS := $(CFLAGS) -fno-rtti -fno-exceptions
 ASFLAGS  := -g $(ARCH)
 LDFLAGS   = -specs=ds_arm9.specs -g $(ARCH) -Wl,-Map,$(notdir $*.map)
 
-LIBS    := -lwoopsi -lfat -lnds9
-LIBDIRS := $(LIBNDS) $(WOOPSI)
+LIBS    := -lwoopsi -lfat -lz -lnds9
+LIBDIRS := $(LIBNDS) $(WOOPSI) /opt/devkitpro/portlibs/nds
 
 ifneq ($(BUILD),$(notdir $(CURDIR)))
 
