@@ -81,12 +81,17 @@ class WordCanvas : public Gadget {
     WoopsiString _word;
     int          _maxScale  = 3;    // user-chosen ceiling; auto-shrinks per word
 
-    // ── Browse state ───────────────────────────────────────────────────────────
-    bool                            _browseMode = false;
-    const std::vector<std::string>* _wordList   = nullptr;
-    int                             _browseIdx  = 0;
-    int                             _prevBrowseIdx  = -1; // word highlighted on last draw
-    int                             _prevFirstLine  = -1; // first visible line on last draw
+    // ── Browse (page) state ────────────────────────────────────────────────────
+    // The page is a fixed set of lines.  Only the highlighted word (red) moves;
+    // the rest of the text stays still until the highlight exits the page, at
+    // which point a new page is loaded with a full redraw.
+    bool                            _browseMode    = false;
+    const std::vector<std::string>* _wordList      = nullptr;
+    int                             _browseIdx     = 0;
+    int                             _pageStartWord = 0;   // first word on current page
+    int                             _pageEndWord   = 0;   // exclusive end (set after layout)
+    int                             _prevBrowseIdx = -1;  // word highlighted on last draw
+    bool                            _pageDirty     = true; // true → full page redraw needed
 
     // ── Shared ─────────────────────────────────────────────────────────────────
     u16      _bgColour;
@@ -181,6 +186,31 @@ class WordCanvas : public Gadget {
         }
     }
 
+    // Returns the first word of the page whose last word is endWord-1, i.e.
+    // the page that comes just before endWord.
+    int findPageStartBefore(int endWord) const {
+        if (!_wordList || endWord <= 0) return 0;
+        const int spW   = (int)_font.getCharWidth((u32)' ');
+        const int W     = getWidth();
+        const int lineH = (int)_font.getHeight() + 3;
+        const int kShow = getHeight() / lineH;
+        // Scan back far enough to capture at least one full page of lines.
+        const int scanS = std::max(0, endWord - kShow * 15);
+
+        std::vector<int> ls;
+        ls.push_back(scanS);
+        int lw = 0;
+        for (int i = scanS; i < endWord; i++) {
+            int ww = 0;
+            for (unsigned char c : (*_wordList)[i]) ww += (int)_font.getCharWidth((u32)c);
+            if (lw > 0 && lw + spW + ww > W) { ls.push_back(i); lw = ww; }
+            else { lw += (lw > 0 ? spW : 0) + ww; }
+        }
+        // The previous page = the last kShow line-starts in ls[]
+        int n = (int)ls.size();
+        return ls[std::max(0, n - kShow)];
+    }
+
     // ── Browse rendering ────────────────────────────────────────────────────────
     // Fills the full screen with word-wrapped book context.  The current word
     // is drawn in red; all other text uses _fgColour.
@@ -198,96 +228,83 @@ class WordCanvas : public Gadget {
     void drawBrowse(GraphicsPort* port) {
         const u16 kRed  = woopsiRGB(31, 0, 0);
         const u8  fontH = _font.getHeight();
-        const int lineH = (int)fontH + 3;          // 3-px leading between lines
+        const int lineH = (int)fontH + 3;
         const int spW   = (int)_font.getCharWidth((u32)' ');
         const int W     = getWidth();
         const int H     = getHeight();
         const int N     = (int)_wordList->size();
-        const int kShow = H / lineH;               // lines that fit on screen
+        const int kShow = H / lineH;
 
-        if (kShow < 1 || N == 0) return;
+        if (kShow < 1 || N == 0 || _pageStartWord >= N) return;
 
-        // ── Word-wrap layout ──────────────────────────────────────────────────
-        const int scanStart = std::max(0, _browseIdx - 300);
-        const int scanEnd   = std::min(N, _browseIdx + 300);
-
-        std::vector<int> lineEnds;  // lineEnds[l] = exclusive end of line l
-        lineEnds.reserve(kShow * 3);
+        // ── Layout: fill kShow lines starting from _pageStartWord ────────────
+        // lineStarts[l] = index of first word on line l.
+        // We lay out one extra line (kShow+1) so we know where the next page
+        // starts even if not all kShow lines are needed.
+        std::vector<int> lineStarts;
+        lineStarts.reserve(kShow + 2);
+        lineStarts.push_back(_pageStartWord);
         int lw = 0;
-        for (int i = scanStart; i < scanEnd; i++) {
+
+        for (int i = _pageStartWord; i < N; i++) {
             int ww = 0;
             for (unsigned char c : (*_wordList)[i]) ww += (int)_font.getCharWidth((u32)c);
-            if (lw > 0 && lw + spW + ww > W) { lineEnds.push_back(i); lw = ww; }
-            else                              { lw += (lw > 0 ? spW : 0) + ww; }
-        }
-        lineEnds.push_back(scanEnd);
-
-        // ── Find current line ─────────────────────────────────────────────────
-        int curLine = 0, ls = scanStart;
-        for (int l = 0; l < (int)lineEnds.size(); l++) {
-            if (_browseIdx >= ls && _browseIdx < lineEnds[l]) { curLine = l; break; }
-            ls = lineEnds[l];
+            if (lw > 0 && lw + spW + ww > W) {
+                lineStarts.push_back(i);
+                lw = ww;
+                if ((int)lineStarts.size() > kShow) break;  // one extra line detected
+            } else {
+                lw += (lw > 0 ? spW : 0) + ww;
+            }
         }
 
-        // ── Choose visible window (current line centred) ───────────────────────
-        int first = std::max(0, curLine - kShow / 2);
-        int last  = std::min((int)lineEnds.size() - 1, first + kShow - 1);
-        first     = std::max(0, last - kShow + 1);
-        const int visLines = last - first + 1;
-        const s16 yBase    = (s16)((H - visLines * lineH) / 2);
+        const int numLines = (int)lineStarts.size();
+        const int visLines = std::min(numLines, kShow);
 
-        // ── Diff with previous draw ───────────────────────────────────────────
-        const int prevFirst = _prevFirstLine;
-        const int prevIdx   = _prevBrowseIdx;
-        _prevFirstLine = first;
+        // Cache the first word of the next page so setBrowseIdx can detect
+        // when the highlight exits this page (forward).
+        _pageEndWord = (numLines > kShow) ? lineStarts[kShow] : N;
+
+        // ── Full or partial update ────────────────────────────────────────────
+        const bool fullDraw   = _pageDirty;
+        const int  prevBrowse = _prevBrowseIdx;
         _prevBrowseIdx = _browseIdx;
+        _pageDirty     = false;
 
-        const bool firstDraw  = (prevFirst < 0);
-        const bool viewShifted= firstDraw || (first != prevFirst);
-
-        if (viewShifted) {
-            // Full clear — single DMA fill, very fast
+        if (fullDraw) {
             port->drawFilledRect(0, 0, (u16)W, (u16)H, _bgColour);
         }
 
-        // ── Render visible lines ──────────────────────────────────────────────
-        ls = scanStart;
-        for (int l = 0; l < (int)lineEnds.size(); l++) {
-            const int lEnd = lineEnds[l];
-            if (l >= first && l <= last) {
-                const s16 lineY = yBase + (s16)((l - first) * lineH);
-                s16 x = 0;
-                for (int wi = ls; wi < lEnd; wi++) {
-                    if (wi > ls) x += (s16)spW;
+        const s16 yBase = (s16)((H - visLines * lineH) / 2);
 
-                    // Measure word pixel width (needed for x advancement and
-                    // for the partial-update background clear).
-                    int ww = 0;
-                    for (unsigned char c : (*_wordList)[wi])
-                        ww += (int)_font.getCharWidth((u32)c);
+        for (int l = 0; l < visLines; l++) {
+            const s16 lineY = yBase + (s16)(l * lineH);
+            // End of this line = start of next line (or _pageEndWord for last visible)
+            const int lEnd = (l + 1 < numLines) ? lineStarts[l + 1] : _pageEndWord;
+            s16 x = 0;
 
-                    const bool wasHl   = (!firstDraw && wi == prevIdx);
-                    const bool isHl    = (wi == _browseIdx);
-                    const bool needDraw= viewShifted || wasHl || isHl;
+            for (int wi = lineStarts[l]; wi < lEnd; wi++) {
+                if (wi > lineStarts[l]) x += (s16)spW;
 
-                    if (needDraw) {
-                        const u16 fg = isHl ? kRed : _fgColour;
-                        if (!viewShifted) {
-                            // Partial update: clear only this word's rect so
-                            // the colour change doesn't ghost over old pixels.
-                            port->drawFilledRect(x, lineY, (u16)ww, (u16)fontH, _bgColour);
-                        }
-                        // drawText renders transparent background — one call
-                        // per word, internally optimised by Woopsi.
-                        port->drawText(x, lineY, &_font,
-                                       WoopsiString((*_wordList)[wi].c_str()),
-                                       0, (s32)(*_wordList)[wi].size(), fg);
+                int ww = 0;
+                for (unsigned char c : (*_wordList)[wi]) ww += (int)_font.getCharWidth((u32)c);
+
+                const bool wasHl   = (wi == prevBrowse);
+                const bool isHl    = (wi == _browseIdx);
+                const bool needDraw= fullDraw || wasHl || isHl;
+
+                if (needDraw) {
+                    const u16 fg = isHl ? kRed : _fgColour;
+                    if (!fullDraw) {
+                        // Partial update: clear only this word's bounding rect
+                        port->drawFilledRect(x, lineY, (u16)ww, (u16)fontH, _bgColour);
                     }
-                    x += (s16)ww;
+                    port->drawText(x, lineY, &_font,
+                                   WoopsiString((*_wordList)[wi].c_str()),
+                                   0, (s32)(*_wordList)[wi].size(), fg);
                 }
+                x += (s16)ww;
             }
-            ls = lEnd;
-            if (l > last) break;
         }
     }
 
@@ -315,12 +332,31 @@ public:
         _browseMode    = on;
         _wordList      = words;
         _browseIdx     = idx;
-        _prevBrowseIdx = -1;   // force full redraw on first browse frame
-        _prevFirstLine = -1;
+        _prevBrowseIdx = -1;
+        _pageStartWord = idx;
+        _pageEndWord   = 0;
+        _pageDirty     = true;
         markRectsDamaged();
     }
     void setBrowseIdx(int idx) {
-        if (_browseIdx != idx) { _browseIdx = idx; markRectsDamaged(); }
+        if (_browseIdx == idx) return;
+        _browseIdx = idx;
+        if (_pageEndWord == 0) {
+            // Page not yet laid out — just request full redraw
+            _pageDirty = true;
+        } else if (idx >= _pageEndWord) {
+            // Moved past end of current page → advance to next page
+            _pageStartWord = _pageEndWord;
+            _pageEndWord   = 0;
+            _pageDirty     = true;
+        } else if (idx < _pageStartWord) {
+            // Moved before start of current page → go to previous page
+            _pageStartWord = findPageStartBefore(_pageStartWord);
+            _pageEndWord   = 0;
+            _pageDirty     = true;
+        }
+        // else: same page, partial update (leave _pageDirty = false)
+        markRectsDamaged();
     }
 
     // Font size
@@ -665,7 +701,8 @@ class RSVPReaderApp : public Woopsi {
         if (down & (KEY_LEFT | KEY_RIGHT)) {
             _lrHeldSince     = _vblCount;
             _lrLastRepeat    = _vblCount;
-            _browseLingerEnd = 0;          // cancel any pending linger exit
+            _browseLingerEnd = 0;
+            if (!_browseMode) enterBrowse();
             showWord(_currentWord + ((down & KEY_RIGHT) ? 1 : -1));
         } else if (held & (KEY_LEFT | KEY_RIGHT)) {
             const u32 heldFor  = _vblCount - _lrHeldSince;
