@@ -631,6 +631,7 @@ class RSVPReaderApp : public Woopsi {
     u32         _udHeldSince   = 0;      // frame when Up/Down was first pressed
     u32         _udLastRepeat  = 0;      // frame of last Up/Down repeat
     u32         _browseLingerEnd = 0;    // frame at which to exit browse (0=inactive)
+    u32         _lastAutoSave   = 0;    // frame of last autosave
     std::string _currentBookPath;
     std::vector<std::string> _bookPaths;
 
@@ -944,6 +945,12 @@ class RSVPReaderApp : public Woopsi {
         if (_browseLingerEnd > 0 && _vblCount >= _browseLingerEnd) {
             _browseLingerEnd = 0;
             exitBrowse();
+        }
+
+        // Autosave every 10 s (600 frames) when a book is loaded.
+        if (!_currentBookPath.empty() && (_vblCount - _lastAutoSave) >= 600) {
+            _lastAutoSave = _vblCount;
+            saveState();
         }
 
         // RSVP auto-advance is suspended during browse so the user can navigate
